@@ -6,33 +6,81 @@ import type {
   Severity
 } from './types';
 
+const VALID_CATEGORIES = [
+  'occupancy',
+  'energy',
+  'water',
+  'waste',
+  'resource_utilization',
+  'no_confirmed_issue'
+] as const;
+
+const categorySchema = z.preprocess((val) => {
+  if (typeof val === 'string') {
+    const c = val.toLowerCase().trim().replace(/[\s-]+/g, '_');
+    if (VALID_CATEGORIES.includes(c as (typeof VALID_CATEGORIES)[number])) return c;
+    if (c.includes('energy') || c.includes('electric') || c.includes('power') || c.includes('light')) return 'energy';
+    if (c.includes('water') || c.includes('leak') || c.includes('plumb')) return 'water';
+    if (c.includes('waste') || c.includes('trash') || c.includes('garbage')) return 'waste';
+    if (c.includes('occupan') || c.includes('people') || c.includes('crowd')) return 'occupancy';
+    if (c.includes('resource') || c.includes('utiliz')) return 'resource_utilization';
+    if (c.includes('none') || c.includes('no_issue') || c.includes('clear')) return 'no_confirmed_issue';
+  }
+  return 'resource_utilization';
+}, z.enum([
+  'occupancy',
+  'energy',
+  'water',
+  'waste',
+  'resource_utilization',
+  'no_confirmed_issue'
+]));
+
+const severitySchema = z.preprocess((val) => {
+  if (typeof val === 'string') {
+    const s = val.toLowerCase().trim();
+    if (s === 'low' || s === 'medium' || s === 'high' || s === 'critical') return s;
+    if (s === 'warn' || s === 'warning' || s === 'moderate') return 'medium';
+    if (s === 'severe' || s === 'danger') return 'critical';
+    if (s === 'info' || s === 'minor') return 'low';
+  }
+  return 'low';
+}, z.enum(['low', 'medium', 'high', 'critical']));
+
+const confidenceSchema = z.preprocess((val) => {
+  if (val === null || val === undefined) return null;
+  const num = typeof val === 'string' ? parseFloat(val) : Number(val);
+  if (isNaN(num)) return null;
+  if (num > 1 && num <= 100) return num / 100;
+  return Math.max(0, Math.min(1, num));
+}, z.number().min(0).max(1).nullable());
+
 const issueSchema = z.object({
-  category: z.enum([
-    'occupancy',
-    'energy',
-    'water',
-    'waste',
-    'resource_utilization',
-    'no_confirmed_issue'
-  ]),
+  category: categorySchema,
   title: z.string().min(1).max(160),
   evidence: z.string().min(1).max(900),
-  severity: z.enum(['low', 'medium', 'high', 'critical']),
-  confidence: z.number().min(0).max(1).nullable(),
+  severity: severitySchema,
+  confidence: confidenceSchema,
   recommendedAction: z.string().min(1).max(500)
 });
 
 const analysisSchema = z.object({
   summary: z.string().min(1).max(1200),
-  limitations: z.array(z.string().min(1).max(300)).max(8),
-  issues: z.array(issueSchema).max(8),
+  limitations: z.preprocess(
+    (val) => (Array.isArray(val) ? val.map(String) : []),
+    z.array(z.string().min(1).max(300)).max(8)
+  ),
+  issues: z.preprocess(
+    (val) => (Array.isArray(val) ? val : []),
+    z.array(issueSchema).max(8)
+  ),
   overallRecommendation: z.string().min(1).max(800)
 });
 
 export type ValidatedAnalysis = z.infer<typeof analysisSchema>;
 
 const defaultVisionModel = 'gemini-3.1-flash-lite';
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 const REQUEST_TIMEOUT_MS = 45_000;
 
 type GeminiResponse = {
@@ -42,8 +90,9 @@ type GeminiResponse = {
     message?: string;
   };
   candidates?: Array<{
+    finishReason?: string;
     content?: {
-      parts?: Array<{ text?: string }>;
+      parts?: Array<{ text?: string; thought?: boolean }>;
     };
   }>;
 };
@@ -72,6 +121,10 @@ export function getGeminiConfigStatus() {
   };
 }
 
+function stripTrailingCommas(str: string): string {
+  return str.replace(/,\s*([\]}])/g, '$1');
+}
+
 function parseJson(text: string) {
   const cleaned = text
     .replace(/^```(?:json)?\s*/i, '')
@@ -81,18 +134,27 @@ function parseJson(text: string) {
   try {
     return JSON.parse(cleaned);
   } catch {
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
+    try {
+      return JSON.parse(stripTrailingCommas(cleaned));
+    } catch {
+      const start = cleaned.indexOf('{');
+      const end = cleaned.lastIndexOf('}');
 
-    if (start >= 0 && end > start) {
-      try {
-        return JSON.parse(cleaned.slice(start, end + 1));
-      } catch {
-        throw new Error('AI_INVALID_JSON');
+      if (start >= 0 && end > start) {
+        const slice = cleaned.slice(start, end + 1);
+        try {
+          return JSON.parse(slice);
+        } catch {
+          try {
+            return JSON.parse(stripTrailingCommas(slice));
+          } catch {
+            throw new Error('AI_INVALID_JSON');
+          }
+        }
       }
-    }
 
-    throw new Error('AI_INVALID_JSON');
+      throw new Error('AI_INVALID_JSON');
+    }
   }
 }
 
@@ -103,7 +165,7 @@ function wait(ms: number) {
 }
 
 function isRetryableStatus(status: number) {
-  return status === 503 || status === 502 || status === 504;
+  return status === 429 || (status >= 500 && status <= 599);
 }
 
 async function callGemini(
@@ -158,7 +220,11 @@ async function callGemini(
       });
 
       if (attempt < MAX_ATTEMPTS) {
-        await wait(1000 * 2 ** (attempt - 1));
+        const backoffMs = Math.min(
+          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+          8000
+        );
+        await wait(backoffMs);
         continue;
       }
 
@@ -184,7 +250,11 @@ async function callGemini(
         isRetryableStatus(response.status) &&
         attempt < MAX_ATTEMPTS
       ) {
-        await wait(1000 * 2 ** (attempt - 1));
+        const backoffMs = Math.min(
+          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+          8000
+        );
+        await wait(backoffMs);
         continue;
       }
 
@@ -195,10 +265,13 @@ async function callGemini(
       );
     }
 
+    const effectiveStatus = payload.error?.code || response.status;
+
     if (!response.ok || payload.error) {
       console.error('[Gemini] upstream error', {
         model,
         httpStatus: response.status,
+        effectiveStatus,
         providerCode: payload.error?.code,
         providerStatus: payload.error?.status,
         providerMessage: payload.error?.message,
@@ -206,40 +279,53 @@ async function callGemini(
       });
 
       if (
-        isRetryableStatus(response.status) &&
+        isRetryableStatus(effectiveStatus) &&
         attempt < MAX_ATTEMPTS
       ) {
-        await wait(1000 * 2 ** (attempt - 1));
+        const backoffMs = Math.min(
+          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+          8000
+        );
+        await wait(backoffMs);
         continue;
       }
 
-      if (response.status === 401 || response.status === 403) {
+      if (effectiveStatus === 401 || effectiveStatus === 403) {
         throw new Error('AI_INVALID_KEY');
       }
 
-      if (response.status === 404) {
+      if (effectiveStatus === 404) {
         throw new Error('AI_MODEL_UNAVAILABLE');
       }
 
-      if (response.status === 429) {
+      if (effectiveStatus === 429) {
         throw new Error('AI_QUOTA_EXCEEDED');
       }
 
-      if (response.status === 400) {
+      if (effectiveStatus === 400) {
         throw new Error('AI_REQUEST_INVALID');
       }
 
-      if (response.status >= 500) {
+      if (effectiveStatus >= 500 && effectiveStatus <= 599) {
         throw new Error('AI_PROVIDER_UNAVAILABLE');
       }
 
       throw new Error('AI_PROVIDER_ERROR');
     }
 
-    const text = payload.candidates?.[0]?.content?.parts
+    const candidate = payload.candidates?.[0];
+    const nonThoughtText = candidate?.content?.parts
+      ?.filter((part) => !part.thought)
       ?.map((part) => part.text || '')
-      .join('')
-      .trim();
+      ?.join('')
+      ?.trim();
+
+    const allPartsText = candidate?.content?.parts
+      ?.map((part) => part.text || '')
+      ?.join('')
+      ?.trim();
+
+    const text = nonThoughtText || allPartsText;
 
     if (!text) {
       throw new Error('AI_EMPTY_RESPONSE');

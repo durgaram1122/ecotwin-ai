@@ -45,7 +45,12 @@ export async function POST(request: Request) {
     const severity = topSeverity(issues);
     const recommendation: Recommendation = { id: nowId('recommendation'), facilityId: facility.id, analysisId: analysis.id, createdAt: new Date().toISOString(), title: 'Next inspection step', detail: result.overallRecommendation, priority: severity, source: 'ai' };
     const alerts: SustainabilityAlert[] = issues.filter((issue) => issue.category !== 'no_confirmed_issue' && (issue.severity === 'high' || issue.severity === 'critical')).map((issue) => ({ id: nowId('alert'), facilityId: facility.id, category: issue.category, severity: issue.severity, description: `${issue.title}: ${issue.evidence}`, evidenceSource: 'ai_image_analysis', createdAt: new Date().toISOString(), recommendedAction: issue.recommendedAction, status: 'open', analysisId: analysis.id }));
-    await persistAnalysis(analysis, recommendation, alerts);
+    try {
+      await persistAnalysis(analysis, recommendation, alerts);
+    } catch (persistError) {
+      console.error('[Analyses] persistAnalysis failed', persistError);
+      return fail('Analysis was generated but failed to save to storage. Please retry.', 500, 'PERSISTENCE_ERROR');
+    }
     return ok({ analysis, recommendation, alerts });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'AI analysis failed';
