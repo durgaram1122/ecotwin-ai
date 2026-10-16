@@ -79,9 +79,14 @@ const analysisSchema = z.object({
 
 export type ValidatedAnalysis = z.infer<typeof analysisSchema>;
 
-const defaultVisionModel = 'gemini-3.1-flash-lite';
-const MAX_ATTEMPTS = 4;
-const REQUEST_TIMEOUT_MS = 45_000;
+const defaultVisionModel = 'gemini-3.5-flash-lite';
+const fallbackVisionModels = [
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite'
+];
+const MAX_ATTEMPTS_PER_MODEL = 2;
+const REQUEST_TIMEOUT_MS = 35_000;
 
 type GeminiResponse = {
   error?: {
@@ -170,171 +175,194 @@ function isRetryableStatus(status: number) {
 
 async function callGemini(
   contents: unknown[],
-  json = true
-): Promise<string> {
-  const { key, model } = configuredModel();
+  json = true,
+  preferredModel?: string
+): Promise<{ text: string; model: string }> {
+  const { key, model: configuredPrimary } = configuredModel();
+  const initialModel = preferredModel || configuredPrimary;
+  const modelsToTry = [
+    initialModel,
+    ...fallbackVisionModels.filter((m) => m !== initialModel)
+  ];
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      REQUEST_TIMEOUT_MS
-    );
+  let lastError: Error | null = null;
 
-    let response: Response;
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const currentModel = modelsToTry[mIdx];
 
-    try {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json'
-          },
-          signal: controller.signal,
-          body: JSON.stringify({
-            contents,
-            generationConfig: json
-              ? {
-                  temperature: 0.15,
-                  responseMimeType: 'application/json'
-                }
-              : {
-                  temperature: 0.35
-                }
-          })
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_MODEL; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        REQUEST_TIMEOUT_MS
+      );
+
+      let response: Response;
+
+      try {
+        response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:generateContent`,
+          {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-goog-api-key': key
+            },
+            signal: controller.signal,
+            body: JSON.stringify({
+              contents,
+              generationConfig: json
+                ? {
+                    temperature: 0.15,
+                    responseMimeType: 'application/json'
+                  }
+                : {
+                    temperature: 0.35
+                  }
+            })
+          }
+        );
+      } catch (error) {
+        clearTimeout(timeout);
+
+        const timedOut =
+          error instanceof Error && error.name === 'AbortError';
+
+        console.error('[Gemini] request failed', {
+          model: currentModel,
+          attempt,
+          timedOut,
+          errorName:
+            error instanceof Error ? error.name : 'unknown'
+        });
+
+        if (attempt < MAX_ATTEMPTS_PER_MODEL) {
+          const backoffMs = Math.min(
+            1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+            6000
+          );
+          await wait(backoffMs);
+          continue;
         }
-      );
-    } catch (error) {
-      clearTimeout(timeout);
 
-      const timedOut =
-        error instanceof Error && error.name === 'AbortError';
-
-      console.error('[Gemini] request failed', {
-        model,
-        attempt,
-        timedOut,
-        errorName:
-          error instanceof Error ? error.name : 'unknown'
-      });
-
-      if (attempt < MAX_ATTEMPTS) {
-        const backoffMs = Math.min(
-          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
-          8000
+        lastError = new Error(
+          timedOut ? 'AI_TIMEOUT' : 'AI_NETWORK_ERROR'
         );
-        await wait(backoffMs);
-        continue;
+        break;
+      } finally {
+        clearTimeout(timeout);
       }
 
-      throw new Error(
-        timedOut ? 'AI_TIMEOUT' : 'AI_NETWORK_ERROR'
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
+      let payload: GeminiResponse;
 
-    let payload: GeminiResponse;
+      try {
+        payload = (await response.json()) as GeminiResponse;
+      } catch {
+        console.error('[Gemini] upstream response was not valid JSON', {
+          model: currentModel,
+          httpStatus: response.status,
+          attempt
+        });
 
-    try {
-      payload = (await response.json()) as GeminiResponse;
-    } catch {
-      console.error('[Gemini] upstream response was not valid JSON', {
-        model,
-        httpStatus: response.status,
-        attempt
-      });
+        if (
+          isRetryableStatus(response.status) &&
+          attempt < MAX_ATTEMPTS_PER_MODEL
+        ) {
+          const backoffMs = Math.min(
+            1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+            6000
+          );
+          await wait(backoffMs);
+          continue;
+        }
 
-      if (
-        isRetryableStatus(response.status) &&
-        attempt < MAX_ATTEMPTS
-      ) {
-        const backoffMs = Math.min(
-          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
-          8000
+        lastError = new Error(
+          response.status >= 500
+            ? 'AI_PROVIDER_UNAVAILABLE'
+            : 'AI_PROVIDER_ERROR'
         );
-        await wait(backoffMs);
-        continue;
+        break;
       }
 
-      throw new Error(
-        response.status >= 500
-          ? 'AI_PROVIDER_UNAVAILABLE'
-          : 'AI_PROVIDER_ERROR'
-      );
+      const effectiveStatus = payload.error?.code || response.status;
+
+      if (!response.ok || payload.error) {
+        console.error('[Gemini] upstream error', {
+          model: currentModel,
+          httpStatus: response.status,
+          effectiveStatus,
+          providerCode: payload.error?.code,
+          providerStatus: payload.error?.status,
+          providerMessage: payload.error?.message,
+          attempt
+        });
+
+        if (effectiveStatus === 401 || effectiveStatus === 403) {
+          throw new Error('AI_INVALID_KEY');
+        }
+
+        if (effectiveStatus === 400) {
+          throw new Error('AI_REQUEST_INVALID');
+        }
+
+        if (
+          isRetryableStatus(effectiveStatus) &&
+          attempt < MAX_ATTEMPTS_PER_MODEL
+        ) {
+          const backoffMs = Math.min(
+            1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
+            6000
+          );
+          await wait(backoffMs);
+          continue;
+        }
+
+        if (effectiveStatus === 404) {
+          lastError = new Error('AI_MODEL_UNAVAILABLE');
+          console.warn(`[Gemini] Model ${currentModel} unavailable (404), trying fallback...`);
+          break;
+        }
+
+        if (effectiveStatus === 429) {
+          lastError = new Error('AI_QUOTA_EXCEEDED');
+          console.warn(`[Gemini] Model ${currentModel} rate limited (429), trying fallback...`);
+          break;
+        }
+
+        if (effectiveStatus >= 500 && effectiveStatus <= 599) {
+          lastError = new Error('AI_PROVIDER_UNAVAILABLE');
+          console.warn(`[Gemini] Model ${currentModel} temporary error (5xx), trying fallback...`);
+          break;
+        }
+
+        lastError = new Error('AI_PROVIDER_ERROR');
+        break;
+      }
+
+      const candidate = payload.candidates?.[0];
+      const nonThoughtText = candidate?.content?.parts
+        ?.filter((part) => !part.thought)
+        ?.map((part) => part.text || '')
+        ?.join('')
+        ?.trim();
+
+      const allPartsText = candidate?.content?.parts
+        ?.map((part) => part.text || '')
+        ?.join('')
+        ?.trim();
+
+      const text = nonThoughtText || allPartsText;
+
+      if (!text) {
+        lastError = new Error('AI_EMPTY_RESPONSE');
+        break;
+      }
+
+      return { text, model: currentModel };
     }
-
-    const effectiveStatus = payload.error?.code || response.status;
-
-    if (!response.ok || payload.error) {
-      console.error('[Gemini] upstream error', {
-        model,
-        httpStatus: response.status,
-        effectiveStatus,
-        providerCode: payload.error?.code,
-        providerStatus: payload.error?.status,
-        providerMessage: payload.error?.message,
-        attempt
-      });
-
-      if (
-        isRetryableStatus(effectiveStatus) &&
-        attempt < MAX_ATTEMPTS
-      ) {
-        const backoffMs = Math.min(
-          1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500),
-          8000
-        );
-        await wait(backoffMs);
-        continue;
-      }
-
-      if (effectiveStatus === 401 || effectiveStatus === 403) {
-        throw new Error('AI_INVALID_KEY');
-      }
-
-      if (effectiveStatus === 404) {
-        throw new Error('AI_MODEL_UNAVAILABLE');
-      }
-
-      if (effectiveStatus === 429) {
-        throw new Error('AI_QUOTA_EXCEEDED');
-      }
-
-      if (effectiveStatus === 400) {
-        throw new Error('AI_REQUEST_INVALID');
-      }
-
-      if (effectiveStatus >= 500 && effectiveStatus <= 599) {
-        throw new Error('AI_PROVIDER_UNAVAILABLE');
-      }
-
-      throw new Error('AI_PROVIDER_ERROR');
-    }
-
-    const candidate = payload.candidates?.[0];
-    const nonThoughtText = candidate?.content?.parts
-      ?.filter((part) => !part.thought)
-      ?.map((part) => part.text || '')
-      ?.join('')
-      ?.trim();
-
-    const allPartsText = candidate?.content?.parts
-      ?.map((part) => part.text || '')
-      ?.join('')
-      ?.trim();
-
-    const text = nonThoughtText || allPartsText;
-
-    if (!text) {
-      throw new Error('AI_EMPTY_RESPONSE');
-    }
-
-    return text;
   }
 
-  throw new Error('AI_PROVIDER_UNAVAILABLE');
+  throw lastError || new Error('AI_PROVIDER_UNAVAILABLE');
 }
 
 export async function analyzeCampusImage(input: {
@@ -358,20 +386,24 @@ export async function analyzeCampusImage(input: {
 
   const prompt = `You are a careful visual sustainability auditor. Analyze only visible evidence in this still image from the facility "${input.facility.name}" (${input.facility.type}, room ${input.facility.room}). Return exactly one JSON object with these keys and types: summary (string), limitations (array of strings), issues (array), and overallRecommendation (string). Each issues item must use exactly these keys: category (one of occupancy, energy, water, waste, resource_utilization, no_confirmed_issue), title (string), evidence (string), severity (one of low, medium, high, critical), confidence (number from 0 to 1 or null), and recommendedAction (string). Do not use alternate keys such as type or explanation. Do not claim hidden leaks, actual electricity/water consumption, how long a room was empty, or operating states that cannot be seen. Occupancy is an estimate from this still image. If evidence is insufficient, return one no_confirmed_issue item with title, evidence, confidence null, recommendedAction, and severity low. JSON only; no markdown fences.`;
 
-  const text = await callGemini([
-    {
-      role: 'user',
-      parts: [
-        { text: prompt },
-        {
-          inline_data: {
-            mime_type: mimeType,
-            data
+  const { text, model: usedModel } = await callGemini(
+    [
+      {
+        role: 'user',
+        parts: [
+          { text: prompt },
+          {
+            inline_data: {
+              mime_type: mimeType,
+              data
+            }
           }
-        }
-      ]
-    }
-  ]);
+        ]
+      }
+    ],
+    true,
+    model
+  );
 
   let result: ValidatedAnalysis;
 
@@ -379,7 +411,7 @@ export async function analyzeCampusImage(input: {
     result = analysisSchema.parse(parseJson(text));
   } catch (error) {
     console.error('[Gemini] response schema validation failed', {
-      model,
+      model: usedModel,
       issuePaths:
         error instanceof z.ZodError
           ? error.issues
@@ -395,7 +427,7 @@ export async function analyzeCampusImage(input: {
     );
   }
 
-  return { ...result, model };
+  return { ...result, model: usedModel };
 }
 
 export async function generateAdvisorText(input: {
@@ -412,7 +444,7 @@ FACILITY: ${input.facility?.name ?? 'Campus-wide'}
 CONTEXT:
 ${input.context}`;
 
-  return callGemini(
+  const { text } = await callGemini(
     [
       {
         role: 'user',
@@ -421,6 +453,8 @@ ${input.context}`;
     ],
     false
   );
+
+  return text;
 }
 
 export function validateIssues(issues: AnalysisIssue[]) {

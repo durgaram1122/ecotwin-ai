@@ -54,7 +54,7 @@ export async function POST(request: Request) {
     return ok({ analysis, recommendation, alerts });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'AI analysis failed';
-    if (message === 'AI_NOT_CONFIGURED') return fail('Gemini is not configured. Add GEMINI_API_KEY on the server and retry. GEMINI_MODEL defaults to gemini-3.1-flash-lite unless overridden. No analysis was saved.', 503, 'AI_NOT_CONFIGURED');
+    if (message === 'AI_NOT_CONFIGURED') return fail('Gemini is not configured. Add GEMINI_API_KEY on the server and retry. GEMINI_MODEL defaults to gemini-3.5-flash-lite unless overridden. No analysis was saved.', 503, 'AI_NOT_CONFIGURED');
     if (message === 'AI_INVALID_KEY') return fail('Gemini rejected the server key (HTTP 401/403). Check GEMINI_API_KEY in the managed project secrets. No analysis was saved.', 502, 'AI_INVALID_KEY');
     if (message === 'AI_MODEL_UNAVAILABLE') return fail('The configured Gemini model is unavailable (HTTP 404) for this key. Set GEMINI_MODEL to a model returned by the Gemini models endpoint that supports generateContent. No analysis was saved.', 502, 'AI_MODEL_UNAVAILABLE');
     if (message === 'AI_QUOTA_EXCEEDED') return fail('Gemini quota or rate limits were reached (HTTP 429). Retry later or review the project quota. No analysis was saved.', 429, 'AI_QUOTA_EXCEEDED');
